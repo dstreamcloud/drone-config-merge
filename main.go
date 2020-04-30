@@ -23,6 +23,7 @@ import (
 	"github.com/google/go-github/github"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v2"
 )
 
@@ -59,18 +60,16 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 			}
 			return nil, err
 		}
-		if record["kind"] == "virtual-pipeline" {
-			pipelines, ok := record["pipelines"].([]interface{})
-			if !ok {
-				continue
-			}
 
-			for _, in := range pipelines {
-				k, ok := in.(string)
-				if !ok {
-					continue
-				}
-				droneYAML := filepath.Join(k, req.Repo.Config)
+		if record["kind"] == "virtual-pipeline" {
+			recordBytes, _ := json.Marshal(&record)
+			recordStr := string(recordBytes)
+			pipelines := gjson.Get(recordStr, "pipelines")
+
+			for _, item := range pipelines.Array() {
+				key := item.String()
+
+				droneYAML := filepath.Join(key, req.Repo.Config)
 				// TODO parallelism of fetching drone.yml
 				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, droneYAML, &github.RepositoryContentGetOptions{Ref: req.Build.After})
 				if err != nil {
@@ -81,11 +80,7 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 				if err != nil {
 					return nil, err
 				}
-				record := map[string]interface{}{}
-				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
-					return nil, err
-				}
-				dependsOn = append(dependsOn, record["name"].(string))
+				dependsOn = append(dependsOn, gjson.Get(body, "name").String())
 				statuses = append(statuses, &github.RepoStatus{
 					TargetURL: github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
 					State:     github.String("success"),
@@ -135,7 +130,7 @@ type githubAppAuthenticator struct {
 }
 
 func (a *githubAppAuthenticator) RoundTrip(req *http.Request) (*http.Response, error) {
-	if a.accessTokenExpires.Before(time.Now().Add(time.Second * 10)) {
+	if a.accessToken == "" || a.accessTokenExpires.Before(time.Now().Add(time.Second*10)) {
 		a.accessTokenOnce.Do(a.getAccessToken)
 		if a.accessTokenError != nil {
 			return nil, a.accessTokenError
@@ -148,6 +143,7 @@ func (a *githubAppAuthenticator) RoundTrip(req *http.Request) (*http.Response, e
 
 func (a *githubAppAuthenticator) getAccessToken() {
 	a.accessTokenError = nil
+	a.accessToken = ""
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, &jwt.StandardClaims{Issuer: a.id, IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Second * 10).Unix()})
 	tokString, err := tok.SignedString(a.privateKey)
 	if err != nil {
@@ -181,30 +177,8 @@ func (a *githubAppAuthenticator) getAccessToken() {
 		return
 	}
 
-	result := map[string]interface{}{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		a.accessTokenError = err
-		return
-	}
-
-	accessToken, ok := result["token"].(string)
-	if !ok {
-		a.accessTokenError = errors.New(string(body))
-		return
-	}
-
-	expire, ok := result["expires_at"].(string)
-	if !ok {
-		a.accessTokenError = errors.New(string(body))
-		return
-	}
-	expireAt, err := time.Parse("2006-01-02T15:04:05Z", expire)
-	if err != nil {
-		a.accessTokenError = err
-		return
-	}
-	a.accessToken = accessToken
-	a.accessTokenExpires = expireAt
+	a.accessToken = gjson.GetBytes(body, "token").String()
+	a.accessTokenExpires = gjson.GetBytes(body, "expires_at").Time()
 }
 
 func main() {
