@@ -173,7 +173,7 @@ func (a *githubAppAuthenticator) getAccessToken() {
 		return
 	}
 
-	if res.StatusCode%100 != 2 {
+	if res.StatusCode/100 != 2 {
 		a.accessTokenError = errors.New(string(body))
 		return
 	}
