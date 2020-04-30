@@ -70,7 +70,6 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 				if !ok {
 					continue
 				}
-				dependsOn = append(dependsOn, k)
 				droneYAML := filepath.Join(k, req.Repo.Config)
 				// TODO parallelism of fetching drone.yml
 				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, droneYAML, &github.RepositoryContentGetOptions{Ref: req.Build.After})
@@ -86,6 +85,7 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
 					return nil, err
 				}
+				dependsOn = append(dependsOn, record["name"].(string))
 				statuses = append(statuses, &github.RepoStatus{
 					TargetURL: github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
 					State:     github.String("success"),
