@@ -60,12 +60,16 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 			return nil, err
 		}
 		if record["kind"] == "virtual-pipeline" {
-			pipelines, ok := record["pipelines"].([]string)
+			pipelines, ok := record["pipelines"].([]interface{})
 			if !ok {
 				continue
 			}
 
-			for _, k := range pipelines {
+			for _, in := range pipelines {
+				k, ok := in.(string)
+				if !ok {
+					continue
+				}
 				dependsOn = append(dependsOn, k)
 				droneYAML := filepath.Join(k, req.Repo.Config)
 				// TODO parallelism of fetching drone.yml
@@ -83,10 +87,9 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 					return nil, err
 				}
 				statuses = append(statuses, &github.RepoStatus{
-					TargetURL:   github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
-					State:       github.String("success"),
-					Description: github.String("merged virtual pipeline from " + droneYAML),
-					Context:     github.String("drone-config-merge"),
+					TargetURL: github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
+					State:     github.String("success"),
+					Context:   github.String("config-merge/" + droneYAML),
 				})
 
 				records = append(records, record)
@@ -109,12 +112,12 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 
 	go func(owner, repo, ref string, statues []*github.RepoStatus) {
 		for _, stauts := range statuses {
-			_, _, err := p.client.Repositories.CreateStatus(context.Background(), owner, repo, repo, stauts)
+			_, _, err := p.client.Repositories.CreateStatus(context.Background(), owner, repo, ref, stauts)
 			if err != nil {
 				logrus.Errorf("unable to publish statuses: " + err.Error())
 			}
 		}
-	}(req.Repo.Namespace, req.Repo.Namespace, req.Build.After, statuses)
+	}(req.Repo.Namespace, req.Repo.Name, req.Build.After, statuses)
 
 	return &drone.Config{
 		Data: output.String(),
