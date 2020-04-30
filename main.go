@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +50,7 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 	decoder := yaml.NewDecoder(strings.NewReader(entryBody))
 	var records []map[string]interface{}
 	var dependsOn []string
+	var statuses []*github.RepoStatus
 	for {
 		record := map[string]interface{}{}
 		if err := decoder.Decode(&record); err != nil {
@@ -63,8 +67,9 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 
 			for _, k := range pipelines {
 				dependsOn = append(dependsOn, k)
+				droneYAML := filepath.Join(k, req.Repo.Config)
 				// TODO parallelism of fetching drone.yml
-				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, filepath.Join(k, req.Repo.Config), &github.RepositoryContentGetOptions{Ref: req.Build.After})
+				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, droneYAML, &github.RepositoryContentGetOptions{Ref: req.Build.After})
 				if err != nil {
 					return nil, err
 				}
@@ -77,6 +82,12 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
 					return nil, err
 				}
+				statuses = append(statuses, &github.RepoStatus{
+					TargetURL:   github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
+					State:       github.String("success"),
+					Description: github.String("merged virtual pipeline from " + droneYAML),
+					Context:     github.String("drone-config-merge"),
+				})
 
 				records = append(records, record)
 			}
@@ -96,6 +107,15 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 		}
 	}
 
+	go func(owner, repo, ref string, statues []*github.RepoStatus) {
+		for _, stauts := range statuses {
+			_, _, err := p.client.Repositories.CreateStatus(context.Background(), owner, repo, repo, stauts)
+			if err != nil {
+				logrus.Errorf("unable to publish statuses: " + err.Error())
+			}
+		}
+	}(req.Repo.Namespace, req.Repo.Namespace, req.Build.After, statuses)
+
 	return &drone.Config{
 		Data: output.String(),
 	}, nil
@@ -104,7 +124,7 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 type githubAppAuthenticator struct {
 	id                 string
 	installationID     string
-	privateKey         []byte
+	privateKey         *rsa.PrivateKey
 	accessToken        string
 	accessTokenExpires time.Time
 	accessTokenOnce    *sync.Once
@@ -187,11 +207,17 @@ func (a *githubAppAuthenticator) getAccessToken() {
 func main() {
 	cfg := &Config{}
 	envconfig.MustProcess("", cfg)
+	privPem, _ := pem.Decode([]byte(cfg.GithubAPPPrivateKey))
+	privKey, err := x509.ParsePKCS1PrivateKey(privPem.Bytes)
+	if err != nil {
+		panic(err)
+	}
+
 	client := &http.Client{
 		Transport: &githubAppAuthenticator{
 			id:              cfg.GithubAPPID,
 			installationID:  cfg.GithubAPPInstallationID,
-			privateKey:      []byte(cfg.GithubAPPPrivateKey),
+			privateKey:      privKey,
 			accessTokenOnce: &sync.Once{},
 		},
 	}
