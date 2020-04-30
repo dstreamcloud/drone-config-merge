@@ -3,6 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
+
 	"github.com/drone/drone-go/drone"
 	"github.com/drone/drone-go/plugin/config"
 	"github.com/google/go-github/github"
@@ -10,10 +15,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"gopkg.in/yaml.v2"
-	"io"
-	"net/http"
-	"path/filepath"
-	"strings"
 )
 
 type Config struct {
@@ -27,8 +28,11 @@ type plugin struct {
 }
 
 func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, error) {
-	println(req.Repo.Config)
-	decoder := yaml.NewDecoder(strings.NewReader(req.Repo.Config))
+	entry, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, req.Repo.Config, &github.RepositoryContentGetOptions{Ref: req.Build.Ref})
+	if err != nil {
+		return nil, err
+	}
+	decoder := yaml.NewDecoder(strings.NewReader(*entry.Content))
 	var records []map[string]interface{}
 	var dependsOn []string
 	for {
@@ -48,7 +52,7 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 			for _, k := range pipelines {
 				dependsOn = append(dependsOn, k)
 				// TODO parallelism of fetching drone.yml
-				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, filepath.Join(k, ".drone.yml"), &github.RepositoryContentGetOptions{Ref: req.Build.Ref})
+				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, filepath.Join(k, req.Repo.Config), &github.RepositoryContentGetOptions{Ref: req.Build.Ref})
 				if err != nil {
 					return nil, err
 				}
