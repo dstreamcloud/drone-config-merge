@@ -28,11 +28,15 @@ type plugin struct {
 }
 
 func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, error) {
-	entry, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, req.Repo.Config, &github.RepositoryContentGetOptions{Ref: req.Build.Ref})
+	entry, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, req.Repo.Config, &github.RepositoryContentGetOptions{Ref: req.Build.After})
 	if err != nil {
 		return nil, err
 	}
-	decoder := yaml.NewDecoder(strings.NewReader(*entry.Content))
+	entryBody, err := entry.GetContent()
+	if err != nil {
+		return nil, err
+	}
+	decoder := yaml.NewDecoder(strings.NewReader(entryBody))
 	var records []map[string]interface{}
 	var dependsOn []string
 	for {
@@ -52,12 +56,15 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 			for _, k := range pipelines {
 				dependsOn = append(dependsOn, k)
 				// TODO parallelism of fetching drone.yml
-				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, filepath.Join(k, req.Repo.Config), &github.RepositoryContentGetOptions{Ref: req.Build.Ref})
+				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, filepath.Join(k, req.Repo.Config), &github.RepositoryContentGetOptions{Ref: req.Build.After})
 				if err != nil {
 					return nil, err
 				}
 
-				body := *content.Content
+				body, err := content.GetContent()
+				if err != nil {
+					return nil, err
+				}
 				record := map[string]interface{}{}
 				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
 					return nil, err
