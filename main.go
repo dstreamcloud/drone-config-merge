@@ -80,13 +80,18 @@ func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, 
 				if err != nil {
 					return nil, err
 				}
-				dependsOn = append(dependsOn, gjson.Get(body, "name").String())
+				record := map[string]interface{}{}
+				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
+					return nil, err
+				}
+				recordBytes, _ := json.Marshal(&record)
+				recordStr := string(recordBytes)
+				dependsOn = append(dependsOn, gjson.Get(recordStr, "name").String())
 				statuses = append(statuses, &github.RepoStatus{
 					TargetURL: github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
 					State:     github.String("success"),
 					Context:   github.String("config-merge/" + droneYAML),
 				})
-
 				records = append(records, record)
 			}
 			continue
