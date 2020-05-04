@@ -36,9 +36,6 @@ func NewAuthenticator(id string, installationID string, privKey *rsa.PrivateKey)
 }
 
 func (a *Authenticator) RoundTrip(req *http.Request) (*http.Response, error) {
-	println(a.token)
-	println(a.expires.String())
-	println(a.expires.Before(time.Now().Add(time.Second * 10)))
 	if a.token == "" || a.expires.Before(time.Now().Add(time.Second*10)) {
 		if atomic.LoadUint32(&a.loading) == 0 {
 			a.getAccessToken()
