@@ -1,30 +1,17 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
-	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
-	"path/filepath"
-	"strings"
-	"sync"
-	"time"
+	"os"
 
-	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/drone/drone-go/drone"
 	"github.com/drone/drone-go/plugin/config"
+	"github.com/dstreamcloud/drone-config-merge/plugin"
 	"github.com/google/go-github/github"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"gopkg.in/yaml.v2"
 )
 
 type Config struct {
@@ -33,157 +20,6 @@ type Config struct {
 	GithubAPPID             string `envconfig:"DRONE_PLUGIN_GITHUB_APP_ID"`
 	GithubAPPInstallationID string `envconfig:"DRONE_PLUGIN_GITHUB_APP_INSTALLATION_ID"`
 	GithubAPPPrivateKey     string `envconfig:"DRONE_PLUGIN_GITHUB_APP_PRIVATE_KEY"`
-}
-
-type plugin struct {
-	client *github.Client
-}
-
-func (p *plugin) Find(ctx context.Context, req *config.Request) (*drone.Config, error) {
-	entry, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, req.Repo.Config, &github.RepositoryContentGetOptions{Ref: req.Build.After})
-	if err != nil {
-		return nil, err
-	}
-	entryBody, err := entry.GetContent()
-	if err != nil {
-		return nil, err
-	}
-	decoder := yaml.NewDecoder(strings.NewReader(entryBody))
-	var records []map[string]interface{}
-	var dependsOn []string
-	var statuses []*github.RepoStatus
-	for {
-		record := map[string]interface{}{}
-		if err := decoder.Decode(&record); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-
-		if record["kind"] == "virtual-pipeline" {
-			recordBytes, _ := json.Marshal(&record)
-			recordStr := string(recordBytes)
-			pipelines := gjson.Get(recordStr, "pipelines")
-
-			for _, item := range pipelines.Array() {
-				key := item.String()
-
-				droneYAML := filepath.Join(key, req.Repo.Config)
-				// TODO parallelism of fetching drone.yml
-				content, _, _, err := p.client.Repositories.GetContents(ctx, req.Repo.Namespace, req.Repo.Name, droneYAML, &github.RepositoryContentGetOptions{Ref: req.Build.After})
-				if err != nil {
-					return nil, err
-				}
-
-				body, err := content.GetContent()
-				if err != nil {
-					return nil, err
-				}
-				record := map[string]interface{}{}
-				if err := yaml.Unmarshal([]byte(body), &record); err != nil {
-					return nil, err
-				}
-				recordBytes, _ := json.Marshal(&record)
-				recordStr := string(recordBytes)
-				dependsOn = append(dependsOn, gjson.Get(recordStr, "name").String())
-				statuses = append(statuses, &github.RepoStatus{
-					TargetURL: github.String(req.Repo.HTTPURL + "/blob/" + req.Build.After + "/" + droneYAML),
-					State:     github.String("success"),
-					Context:   github.String("config-merge/" + droneYAML),
-				})
-				records = append(records, record)
-			}
-			continue
-		}
-		records = append(records, record)
-	}
-
-	output := bytes.NewBuffer(nil)
-	encoder := yaml.NewEncoder(output)
-	for _, record := range records {
-		if record["injectDependencies"] == true {
-			record["depends_on"] = dependsOn
-		}
-		if err := encoder.Encode(&record); err != nil {
-			return nil, err
-		}
-	}
-
-	go func(owner, repo, ref string, statues []*github.RepoStatus) {
-		for _, stauts := range statuses {
-			_, _, err := p.client.Repositories.CreateStatus(context.Background(), owner, repo, ref, stauts)
-			if err != nil {
-				logrus.Errorf("unable to publish statuses: " + err.Error())
-			}
-		}
-	}(req.Repo.Namespace, req.Repo.Name, req.Build.After, statuses)
-
-	return &drone.Config{
-		Data: output.String(),
-	}, nil
-}
-
-type githubAppAuthenticator struct {
-	id                 string
-	installationID     string
-	privateKey         *rsa.PrivateKey
-	accessToken        string
-	accessTokenExpires time.Time
-	accessTokenOnce    *sync.Once
-	accessTokenError   error
-}
-
-func (a *githubAppAuthenticator) RoundTrip(req *http.Request) (*http.Response, error) {
-	if a.accessToken == "" || a.accessTokenExpires.Before(time.Now().Add(time.Second*10)) {
-		a.accessTokenOnce.Do(a.getAccessToken)
-		if a.accessTokenError != nil {
-			return nil, a.accessTokenError
-		}
-	}
-
-	req.Header.Set("Authorization", "token "+a.accessToken)
-	return http.DefaultClient.Do(req)
-}
-
-func (a *githubAppAuthenticator) getAccessToken() {
-	a.accessTokenError = nil
-	a.accessToken = ""
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, &jwt.StandardClaims{Issuer: a.id, IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Second * 10).Unix()})
-	tokString, err := tok.SignedString(a.privateKey)
-	if err != nil {
-		a.accessTokenError = err
-		return
-	}
-
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://api.github.com/app/installations/%s/access_tokens", a.installationID), nil)
-	if err != nil {
-		a.accessTokenError = err
-		return
-	}
-
-	req.Header.Set("Authorization", "Bearer "+tokString)
-	req.Header.Set("Accept", "application/vnd.github.machine-man-preview+json")
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		a.accessTokenError = err
-		return
-	}
-	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		a.accessTokenError = err
-		return
-	}
-
-	if res.StatusCode/100 != 2 {
-		a.accessTokenError = errors.New(string(body))
-		return
-	}
-
-	a.accessToken = gjson.GetBytes(body, "token").String()
-	a.accessTokenExpires = gjson.GetBytes(body, "expires_at").Time()
 }
 
 func main() {
@@ -196,18 +32,29 @@ func main() {
 	}
 
 	client := &http.Client{
-		Transport: &githubAppAuthenticator{
-			id:              cfg.GithubAPPID,
-			installationID:  cfg.GithubAPPInstallationID,
-			privateKey:      privKey,
-			accessTokenOnce: &sync.Once{},
-		},
+		Transport: plugin.NewAuthenticator(cfg.GithubAPPID, cfg.GithubAPPInstallationID, privKey),
 	}
 
-	p := &plugin{
-		client: github.NewClient(client),
+	p := plugin.New(github.NewClient(client))
+	var handler http.Handler
+	if os.Getenv("IS_DEVELOPMENT") == "1" {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			req := &config.Request{}
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			res, err := p.Find(r.Context(), req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			json.NewEncoder(w).Encode(res)
+		})
+	} else {
+		handler = config.Handler(p, cfg.Secret, logrus.StandardLogger())
 	}
-	handler := config.Handler(p, cfg.Secret, logrus.StandardLogger())
 	http.Handle("/", handler)
 	logrus.Fatal(http.ListenAndServe(cfg.Addr, nil))
 }
